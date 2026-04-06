@@ -1,0 +1,14 @@
+{
+  "manifest_version": 2,
+  "name": "Zotero Harvest",
+  "version": "1.0.0",
+  "description": "Frictionless extraction of notes, highlights, and metadata to a local markdown file.",
+  "applications": {
+    "zotero": {
+      "id": "harvest@zotero.org",
+      "strict_min_version": "7.0.0",
+      "strict_max_version": "8.*",
+      "update_url": "https://raw.githubusercontent.com/jain-arham-hsr/zotero-harvest/main/update.json"
+    }
+  }
+}
