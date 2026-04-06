@@ -1,0 +1,12 @@
+{
+  "addons": {
+    "harvest@yourname.com": {
+      "updates": [
+        {
+          "version": "1.0.0",
+          "update_link": "https://github.com/jain-arham-hsr/zotero-harvest/releases/download/v1.0.0/zotero-harvest.xpi"
+        }
+      ]
+    }
+  }
+}
