@@ -3,98 +3,53 @@ const { classes: Cc, interfaces: Ci, utils: Cu } = Components;
 var ZoteroHarvest = {
   init: function () {},
 
-  // Core function to harvest selected items
-  harvestSelection: async function () {
+  // 1. Bundle Notes Functionality (Exports selected notes to markdown)
+  bundleNotes: async function () {
     const ZoteroPane = Zotero.getActiveZoteroPane();
     if (!ZoteroPane) return;
 
     const selectedItems = ZoteroPane.getSelectedItems();
-    if (selectedItems.length === 0) return;
+    // Filter: Only accept notes as selection
+    const selectedNotes = selectedItems.filter((item) => item.isNote());
+
+    if (selectedNotes.length === 0) return;
 
     let outputText = `File Generated: ${this.getCurrentDate()}\n\n`;
 
-    // Map to track exactly what to extract per parent to avoid over-exporting
-    let exportMap = new Map();
+    let parentMap = new Map();
     let standaloneNotes = [];
 
-    // 1. Organize Selection Intelligently
-    for (let item of selectedItems) {
-      if (item.isRegularItem()) {
-        // If parent is selected, mark to extract ALL children
-        if (!exportMap.has(item.id)) {
-          exportMap.set(item.id, {
-            parent: item,
-            extractAll: true,
-            specificNotes: [],
-            specificAttachments: [],
+    // Group selected notes by their parent item
+    for (let note of selectedNotes) {
+      let parentID = note.parentItemID;
+      if (parentID) {
+        if (!parentMap.has(parentID)) {
+          parentMap.set(parentID, {
+            parent: Zotero.Items.get(parentID),
+            notes: [],
           });
-        } else {
-          exportMap.get(item.id).extractAll = true;
         }
-      } else if (item.isNote()) {
-        let parentID = item.parentItemID;
-        if (parentID) {
-          if (!exportMap.has(parentID)) {
-            exportMap.set(parentID, {
-              parent: Zotero.Items.get(parentID),
-              extractAll: false,
-              specificNotes: [],
-              specificAttachments: [],
-            });
-          }
-          exportMap.get(parentID).specificNotes.push(item);
-        } else {
-          standaloneNotes.push(item);
-        }
-      } else if (item.isAttachment()) {
-        let parentID = item.parentItemID;
-        if (parentID) {
-          if (!exportMap.has(parentID)) {
-            exportMap.set(parentID, {
-              parent: Zotero.Items.get(parentID),
-              extractAll: false,
-              specificNotes: [],
-              specificAttachments: [],
-            });
-          }
-          exportMap.get(parentID).specificAttachments.push(item);
-        }
+        parentMap.get(parentID).notes.push(note);
+      } else {
+        standaloneNotes.push(note);
       }
     }
 
-    // 2. Process Mapped Items
-    for (let [parentID, data] of exportMap) {
-      let item = data.parent;
-      outputText += this.formatMetadata(item);
-      let contentText = "";
+    // Process grouped notes and append parent metadata
+    for (let [parentID, data] of parentMap) {
+      outputText += this.formatMetadata(data.parent);
 
-      // A. Process Notes (Either ALL or only the specific ones selected)
-      let notesToProcess = data.extractAll
-        ? item.getNotes().map((id) => Zotero.Items.get(id))
-        : data.specificNotes;
-      for (let noteItem of notesToProcess) {
-        let rawNote = this.stripHTML(noteItem.getNote());
+      let contentText = "";
+      for (let note of data.notes) {
+        let rawNote = this.stripHTML(note.getNote());
         rawNote = this.cleanZoteroCruft(rawNote);
         if (rawNote) contentText += `${rawNote}\n\n`;
-      }
-
-      // B. Process PDF Annotations (Either ALL or only the specific ones selected)
-      let attachmentsToProcess = data.extractAll
-        ? item.getAttachments().map((id) => Zotero.Items.get(id))
-        : data.specificAttachments;
-      let annotations = await this.getItemAnnotations(attachmentsToProcess);
-      if (annotations) {
-        contentText += `${annotations}\n`;
-      }
-
-      if (contentText.trim() === "") {
-        contentText = "No notes or highlights selected for this source.\n\n";
       }
 
       outputText += contentText.trim() + "\n\n";
     }
 
-    // 3. Process Standalone Notes
+    // Process Standalone Notes
     if (standaloneNotes.length > 0) {
       outputText += `## Standalone Notes\n---\n`;
       for (let note of standaloneNotes) {
@@ -106,30 +61,32 @@ var ZoteroHarvest = {
     await this.writeToFile(outputText.trim());
   },
 
-  // Helper: Extract Annotations cleanly (Updated to accept an array of specific attachments)
-  getItemAnnotations: async function (attachments) {
-    let annotationText = "";
+  // 2. Harvest Annotations Functionality (Creates a Zotero Note & Deletes original annotations)
+  harvestAnnotations: async function () {
+    const ZoteroPane = Zotero.getActiveZoteroPane();
+    if (!ZoteroPane) return;
 
-    for (let attachment of attachments) {
-      // If we are passed an ID instead of an object, fetch the object
-      if (typeof attachment === "number" || typeof attachment === "string") {
-        attachment = await Zotero.Items.getAsync(attachment);
-      }
+    const selectedItems = ZoteroPane.getSelectedItems();
+    // Filter: Only accept annotations as selection
+    const annotations = selectedItems.filter((item) => item.isAnnotation());
 
-      if (attachment.attachmentContentType === "application/pdf") {
-        let annotations = Zotero.Items.get(attachment.getAnnotations());
-        for (let anno of annotations) {
-          let page = anno.annotationPageLabel || "?";
-          let text = anno.annotationText || "";
-          let comment = anno.annotationComment || "";
+    if (annotations.length === 0) return;
 
-          // Clean printing without explicit prefixes
-          if (text) annotationText += `"${text}" (p. ${page})\n\n`;
-          if (comment) annotationText += `${comment}\n\n`;
-        }
-      }
+    try {
+      // Trigger Zotero's native extraction to generate the note
+      await ZoteroPane.addNoteFromAnnotationsFromSelected();
+
+      // Wait a brief moment to ensure the database transaction completes for the new note
+      await new Promise((resolve) => setTimeout(resolve, 500));
+
+      // Trash the original selected annotations
+      let annoIDs = annotations.map((a) => a.id);
+      await Zotero.Items.trashTx(annoIDs);
+    } catch (e) {
+      Zotero.logError(
+        "Zotero Harvest Error: Could not harvest annotations | " + e,
+      );
     }
-    return annotationText.trim();
   },
 
   // Helper: Remove useless Zotero auto-generated text
@@ -186,7 +143,6 @@ var ZoteroHarvest = {
     let citation = `${authorString} (${year}). _${title}_. ${publisher}`;
     if (url) citation += ` URL: ${url}`;
 
-    // Clean Markdown Header (No square brackets, no "Source:" prefix)
     let metaString = `## ${title}\n`;
     metaString += `**Type:** ${itemTypeStr}\n`;
     metaString += `**Citation:** ${citation.trim()}\n`;
@@ -231,7 +187,7 @@ var ZoteroHarvest = {
     try {
       await Zotero.File.putContentsAsync(filePath, content);
       let progressWin = new Zotero.ProgressWindow();
-      progressWin.changeHeadline("Harvest Successful");
+      progressWin.changeHeadline("Bundle Successful");
       progressWin.addLines(["Exported to: " + filePath]);
       progressWin.show();
       progressWin.startCloseTimer(2500);
@@ -255,15 +211,27 @@ function startup({ id, version, resourceURI, rootURI }) {
   if (window) {
     let menu = window.document.getElementById("zotero-itemmenu");
     if (menu) {
-      let menuItem = window.document.createXULElement("menuitem");
-      menuItem.setAttribute("id", "zotero-harvest-menu-item");
-      menuItem.setAttribute("label", "Harvest Selection");
-      menuItem.addEventListener(
+      // Create 'Bundle Notes' Menu Item
+      let bundleMenuItem = window.document.createXULElement("menuitem");
+      bundleMenuItem.setAttribute("id", "zotero-harvest-bundle-notes");
+      bundleMenuItem.setAttribute("label", "Bundle Notes");
+      bundleMenuItem.addEventListener(
         "command",
-        () => ZoteroHarvest.harvestSelection(),
+        () => ZoteroHarvest.bundleNotes(),
         false,
       );
-      menu.appendChild(menuItem);
+      menu.appendChild(bundleMenuItem);
+
+      // Create 'Harvest Annotations' Menu Item
+      let harvestMenuItem = window.document.createXULElement("menuitem");
+      harvestMenuItem.setAttribute("id", "zotero-harvest-annotations");
+      harvestMenuItem.setAttribute("label", "Harvest Annotations");
+      harvestMenuItem.addEventListener(
+        "command",
+        () => ZoteroHarvest.harvestAnnotations(),
+        false,
+      );
+      menu.appendChild(harvestMenuItem);
     }
   }
 }
@@ -271,7 +239,14 @@ function shutdown() {
   Zotero.debug("Zotero Harvest Shutting down...");
   let window = Zotero.getMainWindow();
   if (window) {
-    let menuItem = window.document.getElementById("zotero-harvest-menu-item");
-    if (menuItem) menuItem.remove();
+    let bundleMenuItem = window.document.getElementById(
+      "zotero-harvest-bundle-notes",
+    );
+    if (bundleMenuItem) bundleMenuItem.remove();
+
+    let harvestMenuItem = window.document.getElementById(
+      "zotero-harvest-annotations",
+    );
+    if (harvestMenuItem) harvestMenuItem.remove();
   }
 }
