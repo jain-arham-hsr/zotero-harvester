@@ -13,47 +13,82 @@ var ZoteroHarvest = {
 
     let outputText = `File Generated: ${this.getCurrentDate()}\n\n`;
 
-    let parentsToProcess = new Set();
+    // Map to track exactly what to extract per parent to avoid over-exporting
+    let exportMap = new Map();
     let standaloneNotes = [];
 
-    // 1. Organize Selection to Avoid Duplicates
+    // 1. Organize Selection Intelligently
     for (let item of selectedItems) {
-      if (item.isNote()) {
+      if (item.isRegularItem()) {
+        // If parent is selected, mark to extract ALL children
+        if (!exportMap.has(item.id)) {
+          exportMap.set(item.id, {
+            parent: item,
+            extractAll: true,
+            specificNotes: [],
+            specificAttachments: [],
+          });
+        } else {
+          exportMap.get(item.id).extractAll = true;
+        }
+      } else if (item.isNote()) {
         let parentID = item.parentItemID;
         if (parentID) {
-          parentsToProcess.add(parentID);
+          if (!exportMap.has(parentID)) {
+            exportMap.set(parentID, {
+              parent: Zotero.Items.get(parentID),
+              extractAll: false,
+              specificNotes: [],
+              specificAttachments: [],
+            });
+          }
+          exportMap.get(parentID).specificNotes.push(item);
         } else {
           standaloneNotes.push(item);
         }
-      } else if (item.isRegularItem()) {
-        parentsToProcess.add(item.id);
+      } else if (item.isAttachment()) {
+        let parentID = item.parentItemID;
+        if (parentID) {
+          if (!exportMap.has(parentID)) {
+            exportMap.set(parentID, {
+              parent: Zotero.Items.get(parentID),
+              extractAll: false,
+              specificNotes: [],
+              specificAttachments: [],
+            });
+          }
+          exportMap.get(parentID).specificAttachments.push(item);
+        }
       }
     }
 
-    // 2. Process Unique Sources (Parents)
-    for (let parentID of parentsToProcess) {
-      let item = Zotero.Items.get(parentID);
+    // 2. Process Mapped Items
+    for (let [parentID, data] of exportMap) {
+      let item = data.parent;
       outputText += this.formatMetadata(item);
-
       let contentText = "";
 
-      // A. Get Zotero Child Notes
-      let noteIDs = item.getNotes();
-      for (let noteID of noteIDs) {
-        let noteItem = Zotero.Items.get(noteID);
+      // A. Process Notes (Either ALL or only the specific ones selected)
+      let notesToProcess = data.extractAll
+        ? item.getNotes().map((id) => Zotero.Items.get(id))
+        : data.specificNotes;
+      for (let noteItem of notesToProcess) {
         let rawNote = this.stripHTML(noteItem.getNote());
         rawNote = this.cleanZoteroCruft(rawNote);
         if (rawNote) contentText += `${rawNote}\n\n`;
       }
 
-      // B. Get PDF Annotations (Highlights & Comments)
-      let annotations = await this.getItemAnnotations(item);
+      // B. Process PDF Annotations (Either ALL or only the specific ones selected)
+      let attachmentsToProcess = data.extractAll
+        ? item.getAttachments().map((id) => Zotero.Items.get(id))
+        : data.specificAttachments;
+      let annotations = await this.getItemAnnotations(attachmentsToProcess);
       if (annotations) {
         contentText += `${annotations}\n`;
       }
 
       if (contentText.trim() === "") {
-        contentText = "No notes or highlights found for this source.\n\n";
+        contentText = "No notes or highlights selected for this source.\n\n";
       }
 
       outputText += contentText.trim() + "\n\n";
@@ -69,6 +104,32 @@ var ZoteroHarvest = {
     }
 
     await this.writeToFile(outputText.trim());
+  },
+
+  // Helper: Extract Annotations cleanly (Updated to accept an array of specific attachments)
+  getItemAnnotations: async function (attachments) {
+    let annotationText = "";
+
+    for (let attachment of attachments) {
+      // If we are passed an ID instead of an object, fetch the object
+      if (typeof attachment === "number" || typeof attachment === "string") {
+        attachment = await Zotero.Items.getAsync(attachment);
+      }
+
+      if (attachment.attachmentContentType === "application/pdf") {
+        let annotations = Zotero.Items.get(attachment.getAnnotations());
+        for (let anno of annotations) {
+          let page = anno.annotationPageLabel || "?";
+          let text = anno.annotationText || "";
+          let comment = anno.annotationComment || "";
+
+          // Clean printing without explicit prefixes
+          if (text) annotationText += `"${text}" (p. ${page})\n\n`;
+          if (comment) annotationText += `${comment}\n\n`;
+        }
+      }
+    }
+    return annotationText.trim();
   },
 
   // Helper: Remove useless Zotero auto-generated text
@@ -145,29 +206,6 @@ var ZoteroHarvest = {
     let formattedHtml = html.replace(/<\/?(p|br|div)[^>]*>/gi, "\n");
     let doc = new DOMParser().parseFromString(formattedHtml, "text/html");
     return (doc.body.textContent || "").trim();
-  },
-
-  // Helper: Extract Annotations cleanly
-  getItemAnnotations: async function (item) {
-    let annotationText = "";
-    const attachmentIDs = item.getAttachments();
-
-    for (let id of attachmentIDs) {
-      let attachment = await Zotero.Items.getAsync(id);
-      if (attachment.attachmentContentType === "application/pdf") {
-        let annotations = Zotero.Items.get(attachment.getAnnotations());
-        for (let anno of annotations) {
-          let page = anno.annotationPageLabel || "?";
-          let text = anno.annotationText || "";
-          let comment = anno.annotationComment || "";
-
-          // Clean printing without explicit prefixes
-          if (text) annotationText += `"${text}" (p. ${page})\n\n`;
-          if (comment) annotationText += `${comment}\n\n`;
-        }
-      }
-    }
-    return annotationText.trim();
   },
 
   // Helper: Overwrite the text file
